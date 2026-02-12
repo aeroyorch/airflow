@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import itertools
@@ -1036,6 +1037,10 @@ class SerializedDAG:
         count = len(tis)
         if count == 0:
             return 0
+
+        for ti in tis:
+            with contextlib.suppress(TaskNotFound):
+                ti.task = self.get_task(ti.task_id)
 
         clear_task_instances(
             list(tis),

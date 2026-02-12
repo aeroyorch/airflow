@@ -183,6 +183,81 @@ def _stop_remaining_tasks(*, task_instance: TaskInstance, task_teardown_map=None
             log.info("Not skipping teardown task '%s'", ti.task_id)
 
 
+def _stop_remaining_tasks_in_group(
+    *,
+    task_instance: TaskInstance,
+    task_group: SerializedTaskGroup,
+    session: Session,
+) -> None:
+    """
+    Stop non-teardown tasks within a TaskGroup.
+
+    :meta private:
+    """
+    if not task_instance.dag_run:
+        raise ValueError("``task_instance`` must have ``dag_run`` set")
+    tasks = list(task_group.iter_tasks())
+    task_ids = {task.task_id for task in tasks}
+    if not task_ids:
+        return
+    task_teardown_map = {task.task_id: task.is_teardown for task in tasks}
+
+    tis = task_instance.dag_run.get_task_instances(session=session)
+    for ti in tis:
+        if ti.task_id == task_instance.task_id or ti.task_id not in task_ids:
+            continue
+        if ti.state in (TaskInstanceState.SUCCESS, TaskInstanceState.FAILED):
+            continue
+        if task_teardown_map.get(ti.task_id, False):
+            log.info("Not skipping teardown task '%s' for TaskGroup '%s'", ti.task_id, task_group.group_id)
+            continue
+        if ti.state == TaskInstanceState.RUNNING:
+            log.info("Forcing task %s to fail due to TaskGroup retry_fast_fail", ti.task_id)
+            msg = "Forcing task to fail due to TaskGroup retry_fast_fail."
+            session.add(Log(event="fail task", extra=msg, task_instance=ti.key))
+            ti.error(session)
+        else:
+            log.info("Setting task %s to SKIPPED due to TaskGroup retry_fast_fail.", ti.task_id)
+            msg = "Skipping task due to TaskGroup retry_fast_fail."
+            session.add(Log(event="skip task", extra=msg, task_instance=ti.key))
+            ti.set_state(state=TaskInstanceState.SKIPPED, session=session)
+
+
+def _handle_task_group_retry_fast_fail(*, task_instance: TaskInstance, session: Session) -> None:
+    from airflow.sdk.definitions.taskgroup import evaluate_task_group_retry_condition
+
+    task = getattr(task_instance, "task", None)
+    if not task:
+        return
+    group = getattr(task, "task_group", None)
+    while group and not getattr(group, "is_root", False):
+        if not getattr(group, "retries", 0) or not getattr(group, "retry_fast_fail", False):
+            group = getattr(group, "parent_group", None)
+            continue
+        task_ids = [task.task_id for task in group.iter_tasks()]
+        if not task_ids:
+            group = getattr(group, "parent_group", None)
+            continue
+        tis = session.scalars(
+            select(TaskInstance).where(
+                TaskInstance.dag_id == task_instance.dag_id,
+                TaskInstance.run_id == task_instance.run_id,
+                TaskInstance.task_id.in_(task_ids),
+            )
+        ).all()
+        retry_condition = getattr(group, "retry_condition", None)
+        should_retry = evaluate_task_group_retry_condition(
+            retry_condition,
+            tis,
+            task_group=group,
+            task_group_id=group.group_id,
+            ti=task_instance,
+        )
+        if should_retry:
+            _stop_remaining_tasks_in_group(task_instance=task_instance, task_group=group, session=session)
+        group = getattr(group, "parent_group", None)
+
+
 def _recalculate_dagrun_queued_at_deadlines(
     dagrun: DagRun, new_queued_at: datetime, session: Session
 ) -> None:
@@ -233,6 +308,7 @@ def clear_task_instances(
     dag_run_state: DagRunState | Literal[False] = DagRunState.QUEUED,
     run_on_latest_version: bool = False,
     prevent_running_task: bool | None = None,
+    clear_task_group_instances: bool = True,
 ) -> None:
     """
     Clear a set of task instances, but make sure the running ones get killed.
@@ -248,13 +324,24 @@ def clear_task_instances(
     :param dag_run_state: state to set finished DagRuns to.
         If set to False, DagRuns state will not be changed.
     :param run_on_latest_version: whether to run on latest serialized DAG and Bundle version
+    :param clear_task_group_instances: whether to clear TaskGroup retry state for affected tasks
 
     :meta private:
     """
     from airflow.exceptions import AirflowClearRunningTaskException
     from airflow.models.dagbag import DBDagBag
+    from airflow.models.taskgroupinstance import TaskGroupInstance
 
     scheduler_dagbag = DBDagBag(load_op_links=False)
+    task_group_ids_by_run: dict[tuple[str, str], set[str]] = defaultdict(set)
+
+    def _collect_task_group_ids(task, *, dag_id: str, run_id: str) -> None:
+        group = getattr(task, "task_group", None)
+        while group is not None and not getattr(group, "is_root", False):
+            if group.group_id:
+                task_group_ids_by_run[(dag_id, run_id)].add(group.group_id)
+            group = getattr(group, "parent_group", None)
+
     for ti in tis:
         ti.prepare_db_for_next_try(session)
 
@@ -270,6 +357,8 @@ def clear_task_instances(
         # set its state to RESTARTING so that
         # the task is terminated and becomes eligible for retry.
         else:
+            if clear_task_group_instances and getattr(ti, "task", None):
+                _collect_task_group_ids(ti.task, dag_id=ti.dag_id, run_id=ti.run_id)
             dr = ti.dag_run
             if run_on_latest_version:
                 ti_dag = scheduler_dagbag.get_latest_version_of_dag(ti.dag_id, session=session)
@@ -281,6 +370,8 @@ def clear_task_instances(
             if ti_dag and ti_dag.has_task(task_id):
                 task = ti_dag.get_task(task_id)
                 ti.refresh_from_task(task)
+                if clear_task_group_instances:
+                    _collect_task_group_ids(task, dag_id=ti.dag_id, run_id=ti.run_id)
                 if TYPE_CHECKING:
                     assert ti.task
                 ti.max_tries = ti.try_number + task.retries
@@ -345,6 +436,16 @@ def clear_task_instances(
                 if dag_run_state == DagRunState.QUEUED:
                     dr.last_scheduling_decision = None
                     dr.start_date = None
+
+    if clear_task_group_instances and task_group_ids_by_run:
+        for (dag_id, run_id), group_ids in task_group_ids_by_run.items():
+            session.execute(
+                delete(TaskGroupInstance).where(
+                    TaskGroupInstance.dag_id == dag_id,
+                    TaskGroupInstance.run_id == run_id,
+                    TaskGroupInstance.task_group_id.in_(group_ids),
+                )
+            )
     session.flush()
 
 
@@ -1556,6 +1657,9 @@ class TaskInstance(Base, LoggingMixin):
                 ti.prepare_db_for_next_try(session)
 
             ti.state = State.UP_FOR_RETRY
+
+        if task:
+            _handle_task_group_retry_fast_fail(task_instance=ti, session=session)
 
         try:
             get_listener_manager().hook.on_task_instance_failed(
