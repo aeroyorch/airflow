@@ -654,6 +654,7 @@ class TestElasticsearchRemoteLogIO:
 
         response = self.elasticsearch_io._es_read(log_id, 2, ti)
 
+        self.elasticsearch_io.client.count.assert_not_called()
         self.elasticsearch_io.client.search.assert_called_once_with(
             index="airflow-logs-*",
             query=query,
